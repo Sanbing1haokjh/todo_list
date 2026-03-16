@@ -5,10 +5,10 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
     QListWidget, QListWidgetItem, QLineEdit, QPushButton, 
-    QLabel, QCheckBox, QMenu, QTabWidget
+    QLabel, QCheckBox, QMenu, QTabWidget, QComboBox
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QColor, QAction
+from PySide6.QtCore import Qt, Signal, QEvent
+from PySide6.QtGui import QFont, QColor, QAction, QCursor
 
 DATA_FILE = "todo.json"
 
@@ -101,13 +101,14 @@ class TodoListApp(QWidget):
         # 1. 待办列表 Widget
         self.todo_list = QListWidget()
         self.todo_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.todo_list.customContextMenuRequested.connect(self.show_context_menu)
+        self.todo_list.customContextMenuRequested.connect(self.show_priority_menu)
         self.todo_list.itemChanged.connect(self.on_item_changed)
+        self.todo_list.itemClicked.connect(self.on_todo_item_clicked)
+        self._last_todo_click_pos = None  # 用于区分点击的是复选框还是文字区域
+        self.todo_list.viewport().installEventFilter(self)
         
         # 2. 历史列表 Widget
         self.history_list = QListWidget()
-        self.history_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.history_list.customContextMenuRequested.connect(self.show_context_menu)
         
         self.tabs.addTab(self.todo_list, "待办事项")
         self.tabs.addTab(self.history_list, "历史记录")
@@ -115,6 +116,20 @@ class TodoListApp(QWidget):
 
         # --- 底部：输入区域 ---
         bottom_layout = QHBoxLayout()
+        
+        # 紧急度选择下拉框
+        self.priority_combo = QComboBox()
+        self.priority_combo.addItems(["🟢 普通", "🟡 重要", "🔴 紧急"])
+        self.priority_combo.setFixedWidth(90)
+        self.priority_combo.setStyleSheet("""
+            QComboBox {
+                background-color: rgba(255, 255, 255, 180);
+                border: 1px solid #E0D492;
+                border-radius: 4px;
+                padding: 6px;
+            }
+        """)
+        
         self.input_edit = QLineEdit()
         self.input_edit.setPlaceholderText("添加新任务...")
         self.input_edit.returnPressed.connect(self.add_task)
@@ -122,6 +137,7 @@ class TodoListApp(QWidget):
         self.add_btn = QPushButton("添加")
         self.add_btn.clicked.connect(self.add_task)
         
+        bottom_layout.addWidget(self.priority_combo)
         bottom_layout.addWidget(self.input_edit)
         bottom_layout.addWidget(self.add_btn)
         main_layout.addLayout(bottom_layout)
@@ -137,23 +153,38 @@ class TodoListApp(QWidget):
         text = self.input_edit.text().strip()
         if not text:
             return
-            
+        
+        # 获取紧急度 (0: 普通, 1: 重要, 2: 紧急)
+        priority = self.priority_combo.currentIndex()
+        
         # 构造任务数据字典
         task_data = {
             "text": text,
             "completed": False,
-            "completed_at": None
+            "completed_at": None,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "priority": priority
         }
         self.create_todo_item(task_data)
         self.input_edit.clear()
         
         # 添加任务后自动切回"待办"页面
         self.tabs.setCurrentIndex(0)
+        
+        # 按紧急度和创建时间排序
+        self.sort_todo_list()
         self.save_data()
 
     def create_todo_item(self, task_data):
         """在待办页面创建列表项"""
-        item = QListWidgetItem(task_data["text"])
+        text = task_data.get("text", "未知任务")
+        created_at = task_data.get("created_at", "")
+        priority = task_data.get("priority", 0)  # 0: 普通, 1: 重要, 2: 紧急
+        priority_texts = ["🟢", "🟡", "🔴"]
+        
+        display_text = f"{priority_texts[priority]} {text}\n  📅 {created_at}"
+        
+        item = QListWidgetItem(display_text)
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         
         # 使用 Qt.UserRole 把完整数据绑定在 item 上
@@ -170,10 +201,13 @@ class TodoListApp(QWidget):
         self.todo_list.addItem(item)
 
     def create_history_item(self, task_data):
-        """在历史页面创建列表项（不带复选框，包含完成时间）"""
+        """在历史页面创建列表项（不带复选框，包含创建时间和完成时间）"""
         text = task_data.get("text", "未知任务")
+        created_at = task_data.get("created_at", "")
+        priority = task_data.get("priority", 0)
+        priority_texts = ["🟢", "🟡", "🔴"]
         time_str = task_data.get("completed_at", "未知时间")
-        display_text = f"{text}\n  🕒 {time_str}"
+        display_text = f"{priority_texts[priority]} {text}\n  📅 {created_at} → 🕒 {time_str}"
         
         item = QListWidgetItem(display_text)
         item.setData(Qt.UserRole, task_data)
@@ -228,25 +262,115 @@ class TodoListApp(QWidget):
             current_list.takeItem(current_row)
             self.save_data()
 
-    def show_context_menu(self, position):
-        """右键菜单"""
+    def show_priority_menu(self, position):
+        """右键菜单 - 紧急度选择"""
         current_list = self.get_current_list()
         item = current_list.itemAt(position)
         if not item:
             return
-            
+
+        # 只有待办列表可以修改紧急度
+        if current_list != self.todo_list:
+            return
+
         menu = QMenu()
         menu.setStyleSheet("""
             QMenu { background-color: white; border: 1px solid #ccc; }
             QMenu::item { padding: 5px 20px; }
             QMenu::item:selected { background-color: #EEE; }
         """)
-        
-        delete_action = QAction("删除任务", self)
-        delete_action.triggered.connect(self.delete_selected_task)
-        menu.addAction(delete_action)
-        
+
+        current_data = item.data(Qt.UserRole)
+        current_priority = current_data.get("priority", 0)
+
+        priority_options = [
+            (0, "🟢 普通"),
+            (1, "🟡 重要"),
+            (2, "🔴 紧急")
+        ]
+
+        for priority_value, priority_label in priority_options:
+            action = QAction(priority_label, self)
+            if priority_value == current_priority:
+                action.setCheckable(True)
+                action.setChecked(True)
+            action.triggered.connect(
+                lambda checked, p=priority_value, it=item: self.change_priority(p, it)
+            )
+            menu.addAction(action)
+
         menu.exec(current_list.mapToGlobal(position))
+
+    def eventFilter(self, obj, event):
+        """记录在待办列表上的点击位置，用于区分复选框与文字区域"""
+        if obj == self.todo_list.viewport() and event.type() == QEvent.MouseButtonPress:
+            self._last_todo_click_pos = event.pos()
+        return super().eventFilter(obj, event)
+
+    def on_todo_item_clicked(self, item):
+        """左键点击待办任务时弹出紧急度选择菜单（点击复选框区域不弹出，避免误触）"""
+        # 若点击位置在复选框区域内，则不弹出菜单，让复选框正常切换完成状态
+        if self._last_todo_click_pos is not None:
+            item_rect = self.todo_list.visualItemRect(item)
+            # 复选框通常在左侧约 24px 内，只在该区域外点击才弹出菜单
+            checkbox_width = 28
+            if item_rect.x() <= self._last_todo_click_pos.x() < item_rect.x() + checkbox_width:
+                self._last_todo_click_pos = None
+                return
+        self._last_todo_click_pos = None
+
+        text = item.text()
+        if not text:
+            return
+
+        data = item.data(Qt.UserRole)
+        current_priority = data.get("priority", 0)
+
+        menu = QMenu()
+        menu.setStyleSheet("""
+            QMenu { background-color: white; border: 1px solid #ccc; }
+            QMenu::item { padding: 5px 20px; }
+            QMenu::item:selected { background-color: #EEE; }
+        """)
+
+        priority_options = [
+            (0, "🟢 普通"),
+            (1, "🟡 重要"),
+            (2, "🔴 紧急")
+        ]
+
+        for priority_value, priority_label in priority_options:
+            action = QAction(priority_label, self)
+            if priority_value == current_priority:
+                action.setCheckable(True)
+                action.setChecked(True)
+            action.triggered.connect(
+                lambda checked, p=priority_value, it=item: self.change_priority(p, it)
+            )
+            menu.addAction(action)
+
+        # 在鼠标当前位置弹出菜单
+        menu.exec(QCursor.pos())
+
+    def change_priority(self, priority, item):
+        """修改任务的紧急度"""
+        # 获取当前任务数据
+        data = item.data(Qt.UserRole)
+        data["priority"] = priority
+
+        # 更新显示文本
+        priority_texts = ["🟢", "🟡", "🔴"]
+        text = data.get("text", "未知任务")
+        created_at = data.get("created_at", "")
+        display_text = f"{priority_texts[priority]} {text}\n  📅 {created_at}"
+        item.setText(display_text)
+
+        # 保存更新后的数据
+        item.setData(Qt.UserRole, data)
+
+        # 重新排序列表
+        self.sort_todo_list()
+        self.save_data()
 
     def toggle_always_on_top(self, state):
         """切换窗口始终置顶"""
@@ -255,6 +379,27 @@ class TodoListApp(QWidget):
         else:
             self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
         self.show()
+
+    def sort_todo_list(self):
+        """按紧急度（从高到低）和创建时间排序待办列表"""
+        items_data = []
+        for i in range(self.todo_list.count()):
+            item = self.todo_list.item(i)
+            data = item.data(Qt.UserRole)
+            # 排序键：紧急度降序，创建时间升序（越早创建越靠前）
+            priority = data.get("priority", 0)
+            created_at = data.get("created_at", "")
+            items_data.append((data, priority, created_at))
+        
+        # 按紧急度降序、创建时间升序排序
+        items_data.sort(key=lambda x: (-x[1], x[2]))
+        
+        # 重新添加排序后的项目（重新创建 item）
+        self.todo_list.blockSignals(True)
+        self.todo_list.clear()
+        for data, _, _ in items_data:
+            self.create_todo_item(data)
+        self.todo_list.blockSignals(False)
 
     def save_data(self):
         """将待办和历史列表保存到 JSON 文件"""
@@ -289,12 +434,17 @@ class TodoListApp(QWidget):
             self.todo_list.blockSignals(True)
             
             for task in tasks:
-                # 核心逻辑：如果下次打开时，检测到已经是完成状态，就放到“历史页”
+                # 兼容旧数据：没有 priority 字段的默认为 0
+                if "priority" not in task:
+                    task["priority"] = 0
+                # 核心逻辑：如果下次打开时，检测到已经是完成状态，就放到"历史页"
                 if task.get("completed", False):
                     self.create_history_item(task)
                 else:
                     self.create_todo_item(task)
-                    
+            
+            # 按紧急度和创建时间排序
+            self.sort_todo_list()
             self.todo_list.blockSignals(False)
             
         except Exception as e:
